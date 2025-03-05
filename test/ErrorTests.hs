@@ -192,7 +192,20 @@ testProxy10 :: Proxy (a :: Nat) -> Proxy (a + 2) -> ()
 testProxy10 = proxyInEq'
 
 testProxy10Errors =
-#if __GLASGOW_HASKELL__ >= 906
+#if __GLASGOW_HASKELL__ >= 910
+  ["Couldn't match type", "GHC.Internal.Data.Type.Ord.OrdCond"
+  ,$(do localeEncoding <- runIO (getLocaleEncoding)
+        if textEncodingName localeEncoding == textEncodingName utf8
+          then litE $ stringL "(CmpNat a (a + 2)) True True False’"
+          else litE $ stringL "(CmpNat a (a + 2)) True True False'"
+    )
+  ,$(do localeEncoding <- runIO (getLocaleEncoding)
+        if textEncodingName localeEncoding == textEncodingName utf8
+          then litE $ stringL "with ‘False"
+          else litE $ stringL "with False"
+    )
+  ]
+#elif __GLASGOW_HASKELL__ >= 906
   [$(do localeEncoding <- runIO (getLocaleEncoding)
         if textEncodingName localeEncoding == textEncodingName utf8
           then litE $ stringL "Couldn't match type ‘Data.Type.Ord.OrdCond"
@@ -315,7 +328,20 @@ testProxy14 :: Proxy (2*a) -> Proxy (4*a) -> ()
 testProxy14 = proxyInEq'
 
 testProxy14Errors =
-#if __GLASGOW_HASKELL__ >= 906
+#if __GLASGOW_HASKELL__ >= 910
+  ["Couldn't match type", "GHC.Internal.Data.Type.Ord.OrdCond"
+  ,$(do localeEncoding <- runIO (getLocaleEncoding)
+        if textEncodingName localeEncoding == textEncodingName utf8
+          then litE $ stringL "(CmpNat (2 * a) (4 * a)) True True False’"
+          else litE $ stringL "(CmpNat (2 * a) (4 * a)) True True False'"
+    )
+  ,$(do localeEncoding <- runIO (getLocaleEncoding)
+        if textEncodingName localeEncoding == textEncodingName utf8
+          then litE $ stringL "with ‘False"
+          else litE $ stringL "with False"
+    )
+  ]
+#elif __GLASGOW_HASKELL__ >= 906
   [$(do localeEncoding <- runIO (getLocaleEncoding)
         if textEncodingName localeEncoding == textEncodingName utf8
           then litE $ stringL "Couldn't match type ‘Data.Type.Ord.OrdCond"
@@ -485,12 +511,12 @@ testProxy20Errors =
 squeezed3 :: (2 <= x, x <= 2) => Proxy x -> Proxy 1
 squeezed3 = id
 
-squeezed3Errors = ["Could not deduce (x ~ 1)"]
+squeezed3Errors = ["Could not deduce", "x ~ 1"]
 
 squeezed4 :: (1 <= x, x <= 1) => Proxy x -> Proxy 3
 squeezed4 = id
 
-squeezed4Errors = ["Could not deduce (x ~ 3)"]
+squeezed4Errors = ["Could not deduce", "x ~ 3"]
 
 urk :: False :~: True
 urk = case sub @0 of Refl -> ineq @(0 - 1)
