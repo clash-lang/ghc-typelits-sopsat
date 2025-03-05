@@ -4,6 +4,8 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE RecordWildCards       #-}
 {-# LANGUAGE TupleSections         #-}
+{-# LANGUAGE TemplateHaskellQuotes #-}
+{-# LANGUAGE ExplicitNamespaces    #-}
 module GHC.TypeLits.SoPSat
   (plugin)
 where
@@ -16,7 +18,7 @@ import Data.IORef
 
 import Data.Set (Set, union, fromList)
 import qualified Data.Set as S
-import Data.List (intersect, partition, find, nubBy)
+import Data.List (intersect, partition, find)
 import Data.Maybe (mapMaybe, fromMaybe, isJust, catMaybes)
 import Data.Functor ((<&>))
 import Data.Function (on)
@@ -35,39 +37,55 @@ import GHC.Core.Predicate
 import GHC.Core.TyCon (TyCon)
 #if MIN_VERSION_ghc(9,6,0)
 import GHC.Core.Type (TyVar, typeKind, coreView, mkTyConApp, mkNumLitTy, mkTyVarTy, tyConAppTyCon_maybe)
-import GHC.Core.TyCo.Compare (eqType, nonDetCmpType, nonDetCmpTc)
+import GHC.Core.TyCo.Compare (eqType, nonDetCmpType)
 #else
 import GHC.Core.Type
-  (TyVar, typeKind, coreView, mkTyConApp, mkNumLitTy, mkTyVarTy, tyConAppTyCon_maybe, eqType, nonDetCmpType, nonDetCmpTc)
+  (TyVar, typeKind, coreView, mkTyConApp, mkNumLitTy, mkTyVarTy, tyConAppTyCon_maybe, eqType, nonDetCmpType)
 #endif
-import GHC.Core.TyCo.Rep (Type(TyConApp, TyVarTy, LitTy), Kind, TyLit (NumTyLit), UnivCoProvenance (PluginProv), PredType)
+import GHC.Core.TyCo.Rep (Type(TyConApp, TyVarTy, LitTy), Kind, TyLit (NumTyLit), UnivCoProvenance (PluginProv), PredType, Coercion)
 
 import GHC.Driver.Plugins
   (Plugin(..), defaultPlugin, purePlugin)
-import GHC.Plugins (mkModuleName, mkTcOcc, fsLit, mkUnivCo, Outputable)
-import GHC.Tc.Plugin (tcLookupTyCon, tcPluginIO, newEvVar)
+import GHC.Plugins (mkUnivCo, Outputable, Name, HscEnv (hsc_NC), thNameToGhcNameIO)
+import GHC.Tc.Plugin (tcLookupTyCon, tcPluginIO, newEvVar, unsafeTcPluginTcM)
 
 import GHC.Tc.Types
-  (TcPlugin(..), TcPluginM, TcPluginSolveResult (..))
+  (TcPlugin(..), TcPluginM, TcPluginSolveResult (..), Env (env_top))
+
+#if MIN_VERSION_ghc(9,12,0)
+import GHC.Tc.Types.Constraint
+  ( Ct, ctEvPred, ctEvidence, isGiven, CtEvidence (..), ctEvExpr, ctLoc, mkNonCanonical
+  , ctEvLoc, setCtEvLoc, TcEvDest (..), emptyRewriterSet
+  )
+import GHC.Tc.Types.CtLoc
+  ( CtLoc, ctLocSpan, setCtLocSpan
+  )
+#else
 import GHC.Tc.Types.Constraint
   ( Ct, ctEvPred, ctEvidence, isGiven, CtEvidence (..), ctEvExpr, ctLoc, mkNonCanonical
   , CtLoc, ctLocSpan, ctEvLoc, setCtEvLoc, setCtLocSpan, TcEvDest (..), emptyRewriterSet
   )
+#endif
+
 import GHC.Tc.Types.Evidence (EvBindsVar, EvTerm (EvExpr), Role (Nominal, Representational), evId, evCast)
 
 import GHC.Types.Unique.FM (emptyUFM)
 
 import GHC.TcPluginM.Extra
-  (tracePlugin, lookupModule, lookupName, newGiven, newWanted)
+  (tracePlugin, newGiven, newWanted)
 
 import SoPSat.Satisfier
-  (SolverState, evalStatements, runStatements, withState, declare, assert, unify, ranges)
+  (SolverState, evalStatements, declare, assert, unify)
 import SoPSat.SoP
   (SoPE(..), OrdRel(..), (|+|), (|-|), (|*|), (|^|))
 import qualified SoPSat.SoP as SoP
 import SoPSat.Internal.SoP
   (SoP (..), Product (..), Symbol (..), Atom (..))
-import GHC.Utils.Outputable (showPprUnsafe, Outputable (..), (<+>), text)
+import GHC.Utils.Outputable (showPprUnsafe, Outputable (..), text)
+import qualified Language.Haskell.TH as TH
+import GHC.Data.IOEnv
+import Data.Type.Ord (OrdCond, type (<=))
+import GHC.TypeError (Assert)
 
 
 isEqPredClass :: PredType -> Bool
@@ -104,17 +122,18 @@ lookupDefs :: TcPluginM Defs
 lookupDefs =
   do
     ref <- tcPluginIO $ newIORef S.empty
-    md <- lookupModule ordModule basePackage
-    ordCond <- look md "OrdCond"
-    leqT <- look md "<="
-    md1 <- lookupModule typeErrModule basePackage
-    assertT <- look md1 "Assert"
+    ordCond <- look ''Data.Type.Ord.OrdCond
+    leqT <- look ''(Data.Type.Ord.<=)
+    assertT <- look ''GHC.TypeError.Assert
     return (ref, (leqT,assertT,ordCond))
   where
-    look md s = tcLookupTyCon =<< lookupName md (mkTcOcc s)
-    ordModule = mkModuleName "Data.Type.Ord"
-    typeErrModule = mkModuleName "GHC.TypeError"
-    basePackage = fsLit "base"
+    look s = lookupTHName s >>= tcLookupTyCon
+
+lookupTHName :: TH.Name -> TcPluginM Name
+lookupTHName th = do
+    nc <- unsafeTcPluginTcM (hsc_NC . env_top <$> getEnv)
+    res <- tcPluginIO $ thNameToGhcNameIO nc th
+    maybe (fail $ "Failed to lookup " ++ show th) return res
 
 
 assertOrUnify :: (Ord f, Ord c)
@@ -226,6 +245,13 @@ tryReduceGiven leqT simplGivens ct = do
   pred' <- mans
   return (pred', toReducedDict (ctEvidence ct) pred', ws')
 
+mkUnivCo' :: UnivCoProvenance -> Role -> Type -> Type -> Coercion
+#if MIN_VERSION_ghc(9,12,0)
+mkUnivCo' prov = mkUnivCo prov []
+#else
+mkUnivCo' = mkUnivCo
+#endif
+
 reduceNatConstr :: [Ct] -> Ct -> TcPluginM (Maybe (EvTerm, [(Type,Type)], [Ct]))
 reduceNatConstr givens ct =
   let pred0 = ctEvPred $ ctEvidence ct
@@ -238,7 +264,7 @@ reduceNatConstr givens ct =
           Just (cls,_) | className cls /= knownNatClassName -> do
                            evVar <- newEvVar pred'
                            let wDict = mkNonCanonical (CtWanted pred' (EvVarDest evVar) (ctLoc ct) emptyRewriterSet)
-                               evCo = mkUnivCo (PluginProv "ghc-typelits-sopsat") Representational pred' pred0
+                               evCo = mkUnivCo' (PluginProv "ghc-typelits-sopsat") Representational pred' pred0
                                ev = evId evVar `evCast` evCo
                            return (Just (ev, tests, [wDict]))
           _ -> return Nothing
@@ -248,7 +274,7 @@ toReducedDict :: CtEvidence -> PredType -> EvTerm
 toReducedDict ct pred' =
   let
     pred0 = ctEvPred ct
-    evCo = mkUnivCo (PluginProv "ghc-typelits-sopsat") Representational pred0 pred'
+    evCo = mkUnivCo' (PluginProv "ghc-typelits-sopsat") Representational pred0 pred'
     ev = ctEvExpr ct `evCast` evCo
   in ev
 
@@ -257,7 +283,7 @@ data SoPVar
   | Var TyVar
 
 instance Ord TyCon where
-  compare = nonDetCmpTc
+  compare k l = nonDetCmpType (TyConApp k []) (TyConApp l [])
 
 instance Eq SoPVar where
   (Const a) == (Const b) = a `eqType` b
@@ -503,11 +529,11 @@ attachEvidence ct preds = do
   holeWanteds <- evSubstPreds (ctLoc ct) preds
   case classifyPredType $ ctEvPred $ ctEvidence ct of
     EqPred NomEq t1 t2 ->
-      let ctEv = mkUnivCo (PluginProv "ghc-typelits-sopsat") Nominal t1 t2
+      let ctEv = mkUnivCo' (PluginProv "ghc-typelits-sopsat") Nominal t1 t2
       in return (Just ((EvExpr (Coercion ctEv), ct), holeWanteds))
     IrredPred p ->
       let t1 = mkTyConApp (cTupleTyCon 0) []
-          co = mkUnivCo (PluginProv "ghc-typelits-sopsat") Representational t1 p
+          co = mkUnivCo' (PluginProv "ghc-typelits-sopsat") Representational t1 p
           dcApp = evId $ dataConWrapId $ cTupleDataCon 0
       in return (Just ((evCast dcApp co, ct), holeWanteds))
     _ -> return Nothing
